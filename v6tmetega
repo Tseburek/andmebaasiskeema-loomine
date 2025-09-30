@@ -1,0 +1,292 @@
+/* ==================================================================
+   SCHEMA UPGRADE: FKs + INDEXes + TESTS (MariaDB 10.5+)
+   Eesmärk:
+     - FK piirangud: likes → (messages, users), messages → (conversations), messages → models, messages → users
+     - Indeksid: idx_messages_conversation_sent, idx_likes_message, idx_likes_user
+     - Testid: EXPLAIN ja ON DELETE CASCADE/SET NULL kontroll
+   ================================================================== */
+
+SET NAMES utf8mb4;
+SET time_zone = '+00:00';
+SET sql_mode = 'NO_AUTO_VALUE_ON_ZERO';
+
+START TRANSACTION;
+
+-- Turvalisuse mõttes: vältida FK kontrolli ümberkujunduse ajal
+SET @OLD_FOREIGN_KEY_CHECKS = @@FOREIGN_KEY_CHECKS;
+SET FOREIGN_KEY_CHECKS = 0;
+
+/* ------------------------------------------------------------------
+   1) LIKES: 1 kasutaja saab 1 sõnumit laikida vaid korra
+   - Duplikaadid ära, id veerg minema, PK (messageId, userId)
+   ------------------------------------------------------------------ */
+
+-- 1.1 Eemalda duplikaadid, jättes alles madalaima id (kui id varem eksisteeris)
+DELETE l1 FROM `likes` l1
+JOIN `likes` l2
+  ON l1.`messageId` = l2.`messageId`
+ AND l1.`userId`    = l2.`userId`
+ AND l1.`id`        > l2.`id`;
+
+-- 1.2 Eemalda olemasolev PK ja id veerg (kui eksisteerib)
+ALTER TABLE `likes`
+  DROP PRIMARY KEY;
+
+ALTER TABLE `likes`
+  DROP COLUMN IF EXISTS `id`;
+
+-- 1.3 Sea komposiit-primaarvõti
+ALTER TABLE `likes`
+  ADD PRIMARY KEY (`messageId`, `userId`);
+
+
+/* ------------------------------------------------------------------
+   2) MODELS: mudelite register
+   ------------------------------------------------------------------ */
+CREATE TABLE IF NOT EXISTS `models` (
+  `id` INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+  `name` VARCHAR(100) NOT NULL,
+  `provider` VARCHAR(100) DEFAULT NULL,
+  `version` VARCHAR(50) NOT NULL DEFAULT '',
+  `context_window_tokens` INT(10) UNSIGNED DEFAULT NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_models_name_version` (`name`, `version`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
+
+/* ------------------------------------------------------------------
+   3) MESSAGES: roll, nullable userId (SET NULL), seos mudeliga,
+      tokenite arvestus (nagu alusfailis) + seos vestlusega (CASCADE)
+   ------------------------------------------------------------------ */
+
+-- 3.1 Lisa roll (kui puudub)
+ALTER TABLE `messages`
+  ADD COLUMN IF NOT EXISTS `role` ENUM('user','assistant','system') NOT NULL DEFAULT 'user' AFTER `userId`;
+
+-- 3.2 Kohanda userId NULL-itavaks ja muuda FK ON DELETE SET NULL
+-- NB! Kui allolev DROP ebaõnnestub FK nime erinevuse tõttu, vaata SHOW CREATE TABLE `messages`;
+ALTER TABLE `messages` DROP FOREIGN KEY `messages_ibfk_2`;
+
+ALTER TABLE `messages`
+  MODIFY COLUMN `userId` INT(10) UNSIGNED NULL;
+
+-- Loo uuesti kasutaja FK: SET NULL kustutamisel, CASCADE uuendamisel
+-- (nimi erineb, et vältida konflikte)
+ALTER TABLE `messages`
+  ADD CONSTRAINT `fk_messages_user`
+  FOREIGN KEY (`userId`) REFERENCES `users`(`id`)
+  ON DELETE SET NULL
+  ON UPDATE CASCADE;
+
+-- 3.3 Lisa viide mudelile (SET NULL kustutamisel)
+ALTER TABLE `messages`
+  ADD COLUMN IF NOT EXISTS `model_id` INT(10) UNSIGNED NULL AFTER `role`;
+
+-- Kui varem eksisteeris teisenimeline FK, vajadusel eemalda see enne lisamist.
+ALTER TABLE `messages`
+  DROP FOREIGN KEY IF EXISTS `messages_ibfk_3`;
+
+ALTER TABLE `messages`
+  ADD CONSTRAINT `fk_messages_model`
+  FOREIGN KEY (`model_id`) REFERENCES `models`(`id`)
+  ON DELETE SET NULL
+  ON UPDATE CASCADE;
+
+-- 3.4 Tokenite ja metrika veerud
+ALTER TABLE `messages`
+  ADD COLUMN IF NOT EXISTS `prompt_tokens` INT(10) UNSIGNED NULL AFTER `message`,
+  ADD COLUMN IF NOT EXISTS `completion_tokens` INT(10) UNSIGNED NULL AFTER `prompt_tokens`,
+  ADD COLUMN IF NOT EXISTS `total_tokens` INT(10)
+    AS (IFNULL(`prompt_tokens`,0) + IFNULL(`completion_tokens`,0)) VIRTUAL,
+  ADD COLUMN IF NOT EXISTS `latency_ms` INT(10) UNSIGNED NULL AFTER `total_tokens`,
+  ADD COLUMN IF NOT EXISTS `cost_usd` DECIMAL(12,6) NULL AFTER `latency_ms`;
+
+-- 3.5 Rolli backfill
+UPDATE `messages` SET `role` = 'user' WHERE `role` IS NULL;
+
+-- 3.6 Vestluse FK: kustutades vestluse kustuvad ka sõnumid
+-- NB! Eeldab, et messages.conversationId ja conversations.id eksisteerivad.
+ALTER TABLE `messages`
+  ADD CONSTRAINT `fk_messages_conversation`
+  FOREIGN KEY (`conversationId`) REFERENCES `conversations`(`id`)
+  ON DELETE CASCADE
+  ON UPDATE CASCADE;
+
+
+/* ------------------------------------------------------------------
+   4) Vestluste jagamine ja mitme osalejaga vestlused
+   ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS `conversation_participants` (
+  `conversationId` INT(10) UNSIGNED NOT NULL,
+  `userId` INT(10) UNSIGNED NOT NULL,
+  `role` ENUM('owner','editor','viewer') NOT NULL DEFAULT 'viewer',
+  `joined_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`conversationId`, `userId`),
+  CONSTRAINT `cp_conversation_fk` FOREIGN KEY (`conversationId`) REFERENCES `conversations`(`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT `cp_user_fk`         FOREIGN KEY (`userId`)        REFERENCES `users`(`id`)         ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
+CREATE TABLE IF NOT EXISTS `conversation_shares` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `conversationId` INT(10) UNSIGNED NOT NULL,
+  `share_token` CHAR(32) NOT NULL,
+  `access` ENUM('viewer','editor') NOT NULL DEFAULT 'viewer',
+  `expires_at` DATETIME NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_share_token` (`share_token`),
+  CONSTRAINT `cs_conversation_fk` FOREIGN KEY (`conversationId`) REFERENCES `conversations`(`id`) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
+
+/* ------------------------------------------------------------------
+   5) TRIGGERID: rolli ja väljade loogika (INSERT/UPDATE)
+   ------------------------------------------------------------------ */
+DELIMITER //
+
+CREATE TRIGGER `trg_messages_role_check_bi`
+BEFORE INSERT ON `messages`
+FOR EACH ROW
+BEGIN
+  IF NEW.`role` = 'user' AND NEW.`userId` IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'messages.role=user nõuab userId väärtust';
+  END IF;
+
+  IF NEW.`role` IN ('assistant','system') AND NEW.`model_id` IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'messages.role=assistant/system nõuab model_id väärtust';
+  END IF;
+END//
+
+CREATE TRIGGER `trg_messages_role_check_bu`
+BEFORE UPDATE ON `messages`
+FOR EACH ROW
+BEGIN
+  IF NEW.`role` = 'user' AND NEW.`userId` IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'messages.role=user nõuab userId väärtust';
+  END IF;
+
+  IF NEW.`role` IN ('assistant','system') AND NEW.`model_id` IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'messages.role=assistant/system nõuab model_id väärtust';
+  END IF;
+END//
+
+DELIMITER ;
+
+
+/* ------------------------------------------------------------------
+   6) VÕÕRVÕTMED LIKES TABELILE
+   - Kustutades sõnumi või kasutaja, kustuvad ka seotud laigid
+   ------------------------------------------------------------------ */
+
+-- Eemalda võimalikud vanad/valenimedega FKid
+ALTER TABLE `likes` DROP FOREIGN KEY IF EXISTS `fk_likes_message`;
+ALTER TABLE `likes` DROP FOREIGN KEY IF EXISTS `fk_likes_user`;
+
+-- Loo FKid
+ALTER TABLE `likes`
+  ADD CONSTRAINT `fk_likes_message`
+  FOREIGN KEY (`messageId`) REFERENCES `messages`(`id`)
+  ON DELETE CASCADE
+  ON UPDATE CASCADE,
+  ADD CONSTRAINT `fk_likes_user`
+  FOREIGN KEY (`userId`) REFERENCES `users`(`id`)
+  ON DELETE CASCADE
+  ON UPDATE CASCADE;
+
+
+/* ------------------------------------------------------------------
+   7) INDEKSID (optimeeritud päringutele)
+   - MariaDB 10.5+ toetab "IF NOT EXISTS"
+   - Päringumustrid:
+     * viimased sõnumid vestluses: WHERE conversationId = ? ORDER BY sent_at DESC
+     * kas kasutaja on sõnumit laikinud: WHERE messageId=? AND userId=?
+     * mitu laiki kasutajal: WHERE userId=?
+   ------------------------------------------------------------------ */
+
+-- Sõnumid vestluses, sorteeritud saatmise aja järgi
+CREATE INDEX IF NOT EXISTS `idx_messages_conversation_sent`
+  ON `messages` (`conversationId`, `sent_at`);
+
+-- Kiirkontroll (messageId, userId) kasutab PRIMARY (komposiit-PK)
+-- Eraldi indeks messageId-le võib aidata COUNT/EXISTS päringuid
+CREATE INDEX IF NOT EXISTS `idx_likes_message`
+  ON `likes` (`messageId`);
+
+-- Päringud, mis filtreerivad ainult userId järgi
+CREATE INDEX IF NOT EXISTS `idx_likes_user`
+  ON `likes` (`userId`);
+
+
+/* ------------------------------------------------------------------
+   8) ANALYZE & STATISTICS (EXPLAIN kasutab ajakohaseid statistikaid)
+   ------------------------------------------------------------------ */
+ANALYZE TABLE `messages`;
+ANALYZE TABLE `likes`;
+
+/* ------------------------------------------------------------------
+   9) TESTIPLOKK (soovi korral käivita; rullitakse ROLLBACK-iga tagasi)
+   Kontrollib:
+     - EXPLAIN kasutab indekseid
+     - ON DELETE CASCADE (conversation → messages, messages → likes)
+     - ON DELETE SET NULL (users → messages)
+   ------------------------------------------------------------------ */
+
+-- Testi eraldamiseks oma transaktsioon
+SAVEPOINT sp_before_tests;
+
+-- Loo ajutised andmed
+INSERT INTO `users` (`id`, `name`) VALUES (999001, 'Test User A') ON DUPLICATE KEY UPDATE `name`=VALUES(`name`);
+INSERT INTO `users` (`id`, `name`) VALUES (999002, 'Test User B') ON DUPLICATE KEY UPDATE `name`=VALUES(`name`);
+
+INSERT INTO `conversations` (`id`, `title`) VALUES (888001, 'Test Conversation') ON DUPLICATE KEY UPDATE `title`=VALUES(`title`);
+
+INSERT INTO `models` (`id`, `name`, `version`) VALUES (777001, 'gpt-4o-mini','1') ON DUPLICATE KEY UPDATE `name`=VALUES(`name`);
+
+INSERT INTO `messages` (`id`,`conversationId`,`userId`,`role`,`model_id`,`message`,`sent_at`)
+VALUES
+  (666001, 888001, 999001, 'user',     NULL,        'hello',   NOW()),
+  (666002, 888001, NULL,    'assistant',777001,     'hi!',     NOW());
+
+-- Laigid
+INSERT IGNORE INTO `likes` (`messageId`,`userId`) VALUES (666001,999002);
+
+-- EXPLAIN: peaks kasutama idx_messages_conversation_sent
+EXPLAIN SELECT * FROM `messages`
+ WHERE `conversationId` = 888001
+ ORDER BY `sent_at` DESC
+ LIMIT 10;
+
+-- EXPLAIN: peaks kasutama PRIMARY (messageId, userId)
+EXPLAIN SELECT 1
+  FROM `likes`
+ WHERE `messageId` = 666001
+   AND `userId`    = 999002;
+
+-- EXPLAIN: peaks kasutama idx_likes_user
+EXPLAIN SELECT COUNT(*)
+  FROM `likes`
+ WHERE `userId` = 999002;
+
+-- Kontroll: ON DELETE SET NULL (kustuta kasutaja 999001 → tema user-sõnumid muutuvad userId=NULL)
+DELETE FROM `users` WHERE `id` = 999001;
+SELECT `id`,`userId`,`role` FROM `messages` WHERE `id` IN (666001,666002);
+
+-- Kontroll: ON DELETE CASCADE vestluse kustutamisel (kustutades vestluse kaovad selle sõnumid)
+DELETE FROM `conversations` WHERE `id` = 888001;
+
+-- Kontroll: sõnumite kadumisel peaksid ka nendega seotud laikimised kaduma (likes ON DELETE CASCADE)
+SELECT * FROM `likes` WHERE `messageId` = 666001;
+
+-- Pööra testid tagasi
+ROLLBACK TO sp_before_tests;
+/* ------------------------------------------------------------------ */
+
+-- Taasta FK kontroll
+SET FOREIGN_KEY_CHECKS = @OLD_FOREIGN_KEY_CHECKS;
+
+COMMIT;
+
+-- EOF
