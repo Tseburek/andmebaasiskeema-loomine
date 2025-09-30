@@ -1,188 +1,141 @@
--- phpMyAdmin SQL Dump
--- version 5.2.2
--- https://www.phpmyadmin.net/
---
--- Host: mariadb
--- Generation Time: Sep 23, 2025 at 01:17 PM
--- Server version: 11.8.3-MariaDB-ubu2404
--- PHP Version: 8.2.29
+-- phpMyAdmin SQL Dump (täiendatud skeem)
+
 
 SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";
-START TRANSACTION;
 SET time_zone = "+00:00";
+START TRANSACTION;
 
---
--- Database: `chatgpt`
---
 
--- --------------------------------------------------------
 
---
--- Table structure for table `conversations`
---
-
-CREATE TABLE `conversations` (
-  `id` int(10) UNSIGNED NOT NULL,
-  `userId` int(10) UNSIGNED NOT NULL,
-  `title` varchar(100) NOT NULL,
-  `created_at` timestamp NULL DEFAULT current_timestamp()
+CREATE TABLE `users` (
+  `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+  `username` varchar(50) NOT NULL,
+  `email` varchar(100) NOT NULL,
+  `password` varchar(255) NOT NULL,
+  `created_at` timestamp NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_users_username` (`username`),
+  UNIQUE KEY `uq_users_email` (`email`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
 
---
--- Dumping data for table `conversations`
---
+INSERT INTO `users` (`id`, `username`, `email`, `password`, `created_at`) VALUES
+(1, 'anna', 'anna@example.com', 'hash1', '2025-09-23 12:28:48'),
+(2, 'mart', 'mart@example.com', 'hash2', '2025-09-23 12:28:48');
+
+CREATE TABLE `models` (
+  `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+  `name` varchar(100) NOT NULL,          -- nt "Model 1"
+  `version` varchar(50) DEFAULT NULL,    -- nt "1.5"
+  `provider` varchar(100) DEFAULT NULL,  -- nt "OpenAI", "Local"
+  `created_at` timestamp NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_models_name_version` (`name`,`version`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
+INSERT INTO `models` (`id`, `name`, `version`, `provider`, `created_at`) VALUES
+(1, 'Model 1', '1.0', 'Demo', current_timestamp()),
+(2, 'Model 1.5', '1.5', 'Demo', current_timestamp());
+
+
+CREATE TABLE `conversations` (
+  `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+  `userId` int(10) UNSIGNED NOT NULL, -- vestluse omanik
+  `title` varchar(150) NOT NULL,
+  `created_at` timestamp NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  KEY `idx_conversations_userId` (`userId`),
+  CONSTRAINT `fk_conversations_user` FOREIGN KEY (`userId`)
+    REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
 
 INSERT INTO `conversations` (`id`, `userId`, `title`, `created_at`) VALUES
 (1, 1, 'Esimene vestlus ChatGPT-ga', '2025-09-23 12:28:48'),
 (2, 2, 'SQL kodutöö abi', '2025-09-23 12:28:48');
 
--- --------------------------------------------------------
-
---
--- Table structure for table `likes`
---
-
-CREATE TABLE `likes` (
-  `id` int(10) UNSIGNED NOT NULL,
-  `messageId` int(10) UNSIGNED NOT NULL,
-  `userId` int(10) UNSIGNED NOT NULL,
-  `reaction` enum('like','dislike') NOT NULL DEFAULT 'like'
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
-
---
--- Dumping data for table `likes`
---
-
-INSERT INTO `likes` (`id`, `messageId`, `userId`, `reaction`) VALUES
-(1, 1, 2, 'like'),
-(2, 2, 1, 'like');
-
--- --------------------------------------------------------
-
---
--- Table structure for table `messages`
---
 
 CREATE TABLE `messages` (
-  `id` int(10) UNSIGNED NOT NULL,
+  `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT,
   `conversationId` int(10) UNSIGNED NOT NULL,
+  `sender_type` enum('user','ai','system') NOT NULL, -- uus: sõnumi päritolu
+  `userId` int(10) UNSIGNED DEFAULT NULL,            -- kui sender_type='user'; muidu NULL
+  `modelId` int(10) UNSIGNED DEFAULT NULL,           -- kui sender_type='ai' või 'system' (vajadusel)
+  `message` longtext NOT NULL,
+  `sent_at` timestamp NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  KEY `idx_messages_conversationId` (`conversationId`),
+  KEY `idx_messages_userId` (`userId`),
+  KEY `idx_messages_modelId` (`modelId`),
+  CONSTRAINT `fk_messages_conversation` FOREIGN KEY (`conversationId`)
+    REFERENCES `conversations` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_messages_user` FOREIGN KEY (`userId`)
+    REFERENCES `users` (`id`) ON DELETE SET NULL,
+  CONSTRAINT `fk_messages_model` FOREIGN KEY (`modelId`)
+    REFERENCES `models` (`id`) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
+INSERT INTO `messages` (`id`, `conversationId`, `sender_type`, `userId`, `modelId`, `message`, `sent_at`) VALUES
+(1, 1, 'user',   1, NULL, 'Tere ChatGPT!', '2025-09-23 12:28:48'),
+(2, 1, 'ai',   NULL, 1, 'Tere Anna! Kuidas saan aidata?', '2025-09-23 12:28:48'),
+(3, 2, 'user',   2, NULL, 'Palun aita mul teha andmebaasi skeem.', '2025-09-23 12:28:48');
+
+
+CREATE TABLE `likes` (
+  `messageId` int(10) UNSIGNED NOT NULL,
   `userId` int(10) UNSIGNED NOT NULL,
-  `message` text NOT NULL,
-  `sent_at` timestamp NULL DEFAULT current_timestamp()
+  `reaction` enum('like','dislike') NOT NULL DEFAULT 'like',
+  `created_at` timestamp NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`messageId`, `userId`),
+  KEY `idx_likes_userId` (`userId`),
+  CONSTRAINT `fk_likes_message` FOREIGN KEY (`messageId`)
+    REFERENCES `messages` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_likes_user` FOREIGN KEY (`userId`)
+    REFERENCES `users` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
 
---
--- Dumping data for table `messages`
---
+-- Näidisandmed (sama kasutaja ei saa sama sõnumit topelt laikida)
+INSERT INTO `likes` (`messageId`, `userId`, `reaction`, `created_at`) VALUES
+(1, 2, 'like', '2025-09-23 12:28:48'),
+(2, 1, 'like', '2025-09-23 12:28:48');
 
-INSERT INTO `messages` (`id`, `conversationId`, `userId`, `message`, `sent_at`) VALUES
-(1, 1, 1, 'Tere ChatGPT!', '2025-09-23 12:28:48'),
-(2, 1, 2, 'Tere Anna! Kuidas saan aidata?', '2025-09-23 12:28:48'),
-(3, 2, 2, 'Palun aita mul teha andmebaasi skeem.', '2025-09-23 12:28:48');
 
--- --------------------------------------------------------
-
---
--- Table structure for table `users`
---
-
-CREATE TABLE `users` (
-  `id` int(10) UNSIGNED NOT NULL,
-  `username` varchar(50) NOT NULL,
-  `email` varchar(100) NOT NULL,
-  `password` varchar(64) NOT NULL
+CREATE TABLE `message_usage` (
+  `messageId` int(10) UNSIGNED NOT NULL,
+  `prompt_tokens` int UNSIGNED DEFAULT 0,
+  `completion_tokens` int UNSIGNED DEFAULT 0,
+  `total_tokens` int UNSIGNED GENERATED ALWAYS AS (`prompt_tokens` + `completion_tokens`) VIRTUAL,
+  `currency` char(3) DEFAULT 'USD',
+  `cost` decimal(18,6) DEFAULT NULL, -- arvuta rakenduses või triggeriga
+  `measured_at` timestamp NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`messageId`),
+  CONSTRAINT `fk_usage_message` FOREIGN KEY (`messageId`)
+    REFERENCES `messages` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
 
---
--- Dumping data for table `users`
---
+-- Näide: märgime AI-sõnumile tokenid
+INSERT INTO `message_usage` (`messageId`, `prompt_tokens`, `completion_tokens`, `currency`, `cost`)
+VALUES (2, 12, 8, 'USD', 0.00050);
 
-INSERT INTO `users` (`id`, `username`, `email`, `password`) VALUES
-(1, 'anna', 'anna@example.com', 'hash1'),
-(2, 'mart', 'mart@example.com', 'hash2');
 
---
--- Indexes for dumped tables
---
+CREATE TABLE `conversation_shares` (
+  `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+  `conversationId` int(10) UNSIGNED NOT NULL,
+  `shared_by_userId` int(10) UNSIGNED NOT NULL,
+  `visibility` enum('private','link','public') NOT NULL DEFAULT 'private',
+  `share_token` varchar(100) DEFAULT NULL, -- kui visibility='link'
+  `created_at` timestamp NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_shares_token` (`share_token`),
+  KEY `idx_shares_conversationId` (`conversationId`),
+  KEY `idx_shares_userId` (`shared_by_userId`),
+  CONSTRAINT `fk_shares_conversation` FOREIGN KEY (`conversationId`)
+    REFERENCES `conversations` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_shares_user` FOREIGN KEY (`shared_by_userId`)
+    REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
 
---
--- Indexes for table `conversations`
---
-ALTER TABLE `conversations`
-  ADD PRIMARY KEY (`id`),
-  ADD KEY `userId` (`userId`);
+-- Näidis: vestlus #1 on lingiga jagatud
+INSERT INTO `conversation_shares`
+(`conversationId`,`shared_by_userId`,`visibility`,`share_token`)
+VALUES (1, 1, 'link', 'share_abc123');
 
---
--- Indexes for table `likes`
---
-ALTER TABLE `likes`
-  ADD PRIMARY KEY (`id`),
-  ADD KEY `messageId` (`messageId`),
-  ADD KEY `userId` (`userId`);
-
---
--- Indexes for table `messages`
---
-ALTER TABLE `messages`
-  ADD PRIMARY KEY (`id`),
-  ADD KEY `conversationId` (`conversationId`),
-  ADD KEY `userId` (`userId`);
-
---
--- Indexes for table `users`
---
-ALTER TABLE `users`
-  ADD PRIMARY KEY (`id`);
-
---
--- AUTO_INCREMENT for dumped tables
---
-
---
--- AUTO_INCREMENT for table `conversations`
---
-ALTER TABLE `conversations`
-  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=3;
-
---
--- AUTO_INCREMENT for table `likes`
---
-ALTER TABLE `likes`
-  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=3;
-
---
--- AUTO_INCREMENT for table `messages`
---
-ALTER TABLE `messages`
-  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=4;
-
---
--- AUTO_INCREMENT for table `users`
---
-ALTER TABLE `users`
-  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=3;
-
---
--- Constraints for dumped tables
---
-
---
--- Constraints for table `conversations`
---
-ALTER TABLE `conversations`
-  ADD CONSTRAINT `conversations_ibfk_1` FOREIGN KEY (`userId`) REFERENCES `users` (`id`) ON DELETE CASCADE;
-
---
--- Constraints for table `likes`
---
-ALTER TABLE `likes`
-  ADD CONSTRAINT `likes_ibfk_1` FOREIGN KEY (`messageId`) REFERENCES `messages` (`id`) ON DELETE CASCADE,
-  ADD CONSTRAINT `likes_ibfk_2` FOREIGN KEY (`userId`) REFERENCES `users` (`id`) ON DELETE CASCADE;
-
---
--- Constraints for table `messages`
---
-ALTER TABLE `messages`
-  ADD CONSTRAINT `messages_ibfk_1` FOREIGN KEY (`conversationId`) REFERENCES `conversations` (`id`) ON DELETE CASCADE,
-  ADD CONSTRAINT `messages_ibfk_2` FOREIGN KEY (`userId`) REFERENCES `users` (`id`) ON DELETE CASCADE;
 COMMIT;
