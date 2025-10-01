@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Mass-andmete generaator sinu MySQL/MariaDB skeemile.
+
+Nõuded mida täidab:
+- Kõigis mitte-lookup tabelites (users, conversations, messages) >= 2,000,000 rida
+- Lookup 'models' väike
+- Ehtsad väärtused, korrektsed FKid, rolle arvestavad triggr’id
+- Partii- ja bulk-sisestus (executemany, 50k kaupa), transaktsioonid
+- Indeksite strateegia: sekundaarsed indeksid taastatakse pärast täitmist
+- Reprodutseeritavus: fikseeritud juhuarvuseeme
+- Raport: rea-arvud, kestused, tervikluse kontroll, realismi kirjeldus
+
+Käivitus:
+  pip install mysql-connector-python
+  Ekspordi ühenduse muutujad või muuda all:
+    MYSQL_HOST=localhost
+    MYSQL_PORT=3306
+    MYSQL_DB=mydb
+    MYSQL_USER=root
+    MYSQL_PASSWORD=secret
+
+  python seed_massive.py
+
+NB! Eeldab, et skeem (FKd, triggerid, komposiit-PK 'likes' jpm) on juba rakendatud.
+"""
+
+import os, sys, math, time, random, string, hashlib
+from datetime import datetime, timedelta
+from collections import defaultdict
+import mysql.connector as mc
+
+# ---------------------------
+# KONFIG
+# ---------------------------
+CFG = {
+    "BATCH_SIZE_USERS": 50_000,
+    "BATCH_SIZE_CONV":  50_000,
+    "BATCH_SIZE_MSG":   50_000,
+    "BATCH_SIZE_LIKE":  50_000,
+    "BATCH_SIZE_PART":  50_000,
+    "BATCH_SIZE_SHARE": 50_000,
+
+    # Minimaalsed kogused (võid suurendada, kuid mitte vähendada):
+    "USERS_TARGET":        2_000_000,
+    "CONVERSATIONS_TARGET":2_000_000,
+    "MESSAGES_TARGET":     2_000_000,
+
+    # Osakaalud / intensiivsus:
+    "MSG_USER_RATIO": 0.55,      # ~55% 'user', ülejäänud 'assistant'
+    "LIKES_PER_MSG_P": 0.12,     # 12% sõnumitest saavad ühe või mitu laiki
+    "MAX_LIKES_PER_MSG": 6,
+    "PARTICIPANTS_EXTRA_P": 0.35,# 35% vestlustel lisaks omanikule veel osalejaid
+    "SHARE_P": 0.03,             # 3% vestlusi jagatakse linkiga
+
+    # Ajaraam:
+    "DATE_START": datetime(2019,1,1),
+    "DATE_END":   datetime.now(),
+
+    # Determinism:
+    "RANDOM_SEED": 424242,
+}
+
+# ---------------------------
+# ÜHENDUS
+# ---------------------------
+DB = {
+    "host": os.getenv("MYSQL_HOST","127.0.0.1"),
+    "port": int(os.getenv("MYSQL_PORT","3306")),
+    "database": os.getenv("MYSQL_DB","test"),
+    "user": os.getenv("MYSQL_USER","root"),
+    "password": os.getenv("MYSQL_PASSWORD",""),
+    "autocommit": False,
+}
+
+# ---------------------------
+# ABI: andmesüntees
+# ---------------------------
+
+random.seed(CFG["RANDOM_SEED"])
+
+FIRST_NAMES = [
+    "Martin","Kristjan","Markus","Rasmus","Siim","Tanel","Karl","Oliver","Erik","Robin",
+    "Anna","Laura","Kaisa","Liis","Mari","Sandra","Eliise","Grete","Triin","Helena",
+    "John","Emily","Michael","Sofia","Lucas","Emma","Daniel","Olivia","Noah","Ava"
+]
+LAST_NAMES = [
+    "Tamm","Sild","Kask","Karjus","Pärn","Saar","Mets","Kalju","Vaher","Lill",
+    "Smith","Johnson","Williams","Brown","Jones","Miller","Davis","Garcia","Rodriguez","Martinez"
+]
+CITIES = [
+    "Tallinn","Tartu","Narva","Pärnu","Viljandi","Rakvere","Kuressaare","Haapsalu",
+    "Helsinki","Riga","Vilnius","Stockholm","Berlin","Warsaw","Prague","Vienna","Madrid","Paris"
+]
+DOMAINS = ["gmail.com","hotmail.com","mail.ee","outlook.com","yahoo.com","company.tld"]
+STREETS = ["Pärna","Kase","Metsa","Sireli","Nurme","Tammsaare","Linnu","Kalda","Punane","Sõpruse"]
+
+MODEL_POOL = [
+    # name, provider, version, ctx
+    ("gpt-4o-mini","OpenAI","1",128000),
+    ("gpt-4o","OpenAI","1",128000),
+    ("llama-3.1-70b","Meta","3.1",32768),
+    ("mistral-large","Mistral","2406",32000),
+]
+
+ROLE_USER = "user"
+ROLE_ASSISTANT = "assistant"
+ROLE_SYSTEM = "system"
+
+def rand_dt():
+    start = CFG["DATE_START"]
+    end   = CFG["DATE_END"]
+    delta = (end - start).total_seconds()
+    t = start + timedelta(seconds = random.randint(0, int(delta)))
+    return t
+
+def rand_address(i:int):
+    street = random.choice(STREETS)
+    nr = (i % 200) + 1
+    city = random.choice(CITIES)
+    zipc = f"{10000 + (i % 89999)}"
+    return f"{street} tn {nr}, {zipc} {city}"
+
+def rand_email(first, last, i):
+    # tagame unikaalsuse suffiksiga
+    loc = f"{first.lower()}.{last.lower()}.{i}"
+    dom = random.choice(DOMAINS)
+    return f"{loc}@{dom}"
+
+def token_counts():
+    # realistlikud vahemikud
+    p = random.randint(5, 4000)
+    c = random.randint(5, 4000)
+    return p, c, p+c
+
+def latency_and_cost(total_tokens:int):
+    # lihtne mudel: ~ 0.2 ... 3.0 s ja hind 0.000001 ... 0.05 * tokens
+    lat = random.randint(80, 3000)
+    cost = round(max(0.000001, total_tokens * random.uniform(0.000002, 0.00002)), 6)
+    return lat, cost
+
+def share_token(conv_id:int):
+    base = f"{conv_id}-{CFG['RANDOM_SEED']}"
+    return hashlib.md5(base.encode()).hexdigest()
+
+# ---------------------------
+# DB ABI
+# ---------------------------
+
+def connect():
+    return mc.connect(**DB)
+
+def exec_many(cursor, sql, rows):
+    cursor.executemany(sql, rows)
+
+def count_rows(cursor, table):
+    cursor.execute(f"SELECT COUNT(*) FROM `{table}`")
+    return cursor.fetchone()[0]
+
+# ---------------------------
+# INDEKSID (drop/restore)
+# ---------------------------
+
+IDX_DDL_DROP = [
+    "DROP INDEX IF EXISTS `idx_messages_conversation_sent` ON `messages`",
+    "DROP INDEX IF EXISTS `idx_likes_message` ON `likes`",
+    "DROP INDEX IF EXISTS `idx_likes_user` ON `likes`",
+]
+IDX_DDL_CREATE = [
+    "CREATE INDEX IF NOT EXISTS `idx_messages_conversation_sent` ON `messages` (`conversationId`, `sent_at`)",
+    "CREATE INDEX IF NOT EXISTS `idx_likes_message` ON `likes` (`messageId`)",
+    "CREATE INDEX IF NOT EXISTS `idx_likes_user` ON `likes` (`userId`)",
+]
+
+# ---------------------------
+# TÄITMINE
+# ---------------------------
+
+def ensure_models(conn):
+    cur = conn.cursor()
+    cur.execute("START TRANSACTION")
+    try:
+        cur.execute("SELECT COUNT(*) FROM `models`")
+        have = cur.fetchone()[0]
+    except:
+        conn.rollback()
+        raise
+    # Lisa väike komplekt, kui tühi:
+    if have == 0:
+        rows = []
+        now = datetime.utcnow()
+        for name,prov,ver,ctx in MODEL_POOL:
+            rows.append((name,prov,ver,ctx, now, None))
+        cur.executemany("""
+            INSERT INTO `models`
+              (`name`,`provider`,`version`,`context_window_tokens`,`created_at`,`updated_at`)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE `updated_at`=VALUES(`updated_at`)
+        """, rows)
+    conn.commit()
+    cur.close()
+
+def seed_users(conn, target):
+    cur = conn.cursor()
+    total = count_rows(cur, "users")
+    to_make = max(0, target - total)
+    made = 0
+    start_t = time.time()
+    while made < to_make:
+        batch = min(CFG["BATCH_SIZE_USERS"], to_make - made)
+        rows = []
+        for i in range(total + made + 1, total + made + batch + 1):
+            fn = random.choice(FIRST_NAMES)
+            ln = random.choice(LAST_NAMES)
+            email = rand_email(fn, ln, i)
+            addr = rand_address(i)
+            created = rand_dt()
+            rows.append((i, f"{fn} {ln}", email, addr, created))
+        cur.execute("START TRANSACTION")
+        exec_many(cur, """
+            INSERT INTO `users` (`id`,`name`,`email`,`address`,`created_at`)
+            VALUES (%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE `name`=VALUES(`name`)
+        """, rows)
+        conn.commit()
+        made += batch
+        print(f"[users] +{batch} (kokku {total+made})")
+    cur.close()
+    return time.time() - start_t
+
+def seed_conversations(conn, target, users_max_id):
+    cur = conn.cursor()
+    total = count_rows(cur, "conversations")
+    to_make = max(0, target - total)
+    made = 0
+    start_t = time.time()
+    while made < to_make:
+        batch = min(CFG["BATCH_SIZE_CONV"], to_make - made)
+        rows = []
+        owners = []
+        for i in range(total + made + 1, total + made + batch + 1):
+            owner = random.randint(1, users_max_id)
+            title = f"Vestlus #{i}"
+            created = rand_dt()
+            rows.append((i, title, created))
+            owners.append((i, owner, "owner"))  # participants
+        cur.execute("START TRANSACTION")
+        exec_many(cur, """
+            INSERT INTO `conversations` (`id`,`title`,`created_at`)
+            VALUES (%s,%s,%s)
+            ON DUPLICATE KEY UPDATE `title`=VALUES(`title`)
+        """, rows)
+        # owner participant kirjed
+        exec_many(cur, """
+            INSERT IGNORE INTO `conversation_participants`
+              (`conversationId`,`userId`,`role`,`joined_at`)
+            VALUES (%s,%s,%s,NOW())
+        """, owners)
+        conn.commit()
+        made += batch
+        print(f"[conversations] +{batch} (kokku {total+made})")
+    cur.close()
+    return time.time() - start_t
+
+def seed_extra_participants(conn, conv_count, users_max_id):
+    cur = conn.cursor()
+    start_t = time.time()
+    # Lisa osalejaid %
+    target_extra = int(conv_count * CFG["PARTICIPANTS_EXTRA_P"])
+    made = 0
+    while made < target_extra:
+        batch = min(CFG["BATCH_SIZE_PART"], target_extra - made)
+        rows = []
+        for _ in range(batch):
+            cid = random.randint(1, conv_count)
+            uid = random.randint(1, users_max_id)
+            role = random.choice(["viewer","editor"])
+            rows.append((cid, uid, role))
+        cur.execute("START TRANSACTION")
+        exec_many(cur, """
+            INSERT IGNORE INTO `conversation_participants`
+              (`conversationId`,`userId`,`role`,`joined_at`)
+            VALUES (%s,%s,%s,NOW())
+        """, rows)
+        conn.commit()
+        made += batch
+        if made % (CFG["BATCH_SIZE_PART"]*5) == 0:
+            print(f"[participants] ~{made}/{target_extra}")
+    cur.close()
+    return time.time() - start_t
+
+def seed_messages(conn, target, users_max_id, conv_max_id, model_ids):
+    cur = conn.cursor()
+    total = count_rows(cur, "messages")
+    to_make = max(0, target - total)
+    made = 0
+    start_t = time.time()
+    while made < to_make:
+        batch = min(CFG["BATCH_SIZE_MSG"], to_make - made)
+        rows = []
+        # NB! rolliloogika kooskõlas triggeritega
+        for i in range(total + made + 1, total + made + batch + 1):
+            cid = random.randint(1, conv_max_id)
+            sent = rand_dt()
+            if random.random() < CFG["MSG_USER_RATIO"]:
+                role = ROLE_USER
+                uid = random.randint(1, users_max_id)
+                mid = None
+            else:
+                role = ROLE_ASSISTANT
+                uid = None
+                mid = random.choice(model_ids)
+            msg = f"Msg {i} in conv {cid}"
+            p, c, tot = token_counts()
+            lat, cost = latency_and_cost(tot)
+            rows.append((i, cid, uid, role, mid, msg, sent, p, c, lat, cost))
+        cur.execute("START TRANSACTION")
+        exec_many(cur, """
+            INSERT INTO `messages`
+              (`id`,`conversationId`,`userId`,`role`,`model_id`,`message`,`sent_at`,
+               `prompt_tokens`,`completion_tokens`,`latency_ms`,`cost_usd`)
+            VALUES
+              (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE `message`=VALUES(`message`)
+        """, rows)
+        conn.commit()
+        made += batch
+        print(f"[messages] +{batch} (kokku {total+made})")
+    cur.close()
+    return time.time() - start_t
+
+def seed_likes(conn, msg_count, users_max_id):
+    cur = conn.cursor()
+    start_t = time.time()
+    target_msgs = int(msg_count * CFG["LIKES_PER_MSG_P"])
+    made = 0
+    while made < target_msgs:
+        batch = min(CFG["BATCH_SIZE_LIKE"], target_msgs - made)
+        rows = []
+        for _ in range(batch):
+            mid = random.randint(1, msg_count)
+            how_many = random.randint(1, CFG["MAX_LIKES_PER_MSG"])
+            # genereeri unikaalsed kasutajad sellele sõnumile
+            uids = random.sample(range(1, users_max_id+1), k=min(how_many, 20))
+            for uid in uids:
+                rows.append((mid, uid))
+        cur.execute("START TRANSACTION")
+        exec_many(cur, """
+            INSERT IGNORE INTO `likes` (`messageId`,`userId`)
+            VALUES (%s,%s)
+        """, rows)
+        conn.commit()
+        made += batch
+        if made % (CFG["BATCH_SIZE_LIKE"]*5) == 0:
+            print(f"[likes] ~{made}/{target_msgs} batchi")
+    cur.close()
+    return time.time() - start_t
+
+def seed_shares(conn, conv_count):
+    cur = conn.cursor()
+    start_t = time.time()
+    target = int(conv_count * CFG["SHARE_P"])
+    made = 0
+    while made < target:
+        batch = min(CFG["BATCH_SIZE_SHARE"], target - made)
+        rows = []
+        for _ in range(batch):
+            cid = random.randint(1, conv_count)
+            token = share_token(cid)
+            access = random.choice(["viewer","editor"])
+            exp = None if random.random()<0.7 else (datetime.utcnow() + timedelta(days=random.randint(1,180)))
+            rows.append((cid, token, access, exp))
+        cur.execute("START TRANSACTION")
+        exec_many(cur, """
+            INSERT IGNORE INTO `conversation_shares`
+              (`conversationId`,`share_token`,`access`,`expires_at`)
+            VALUES (%s,%s,%s,%s)
+        """, rows)
+        conn.commit()
+        made += batch
+        if made % (CFG["BATCH_SIZE_SHARE"]*10) == 0:
+            print(f"[shares] ~{made}/{target}")
+    cur.close()
+    return time.time() - start_t
+
+def drop_secondary_indexes(conn):
+    cur = conn.cursor()
+    cur.execute("START TRANSACTION")
+    for ddl in IDX_DDL_DROP:
+        cur.execute(ddl)
+    conn.commit()
+    cur.close()
+
+def create_secondary_indexes(conn):
+    cur = conn.cursor()
+    cur.execute("START TRANSACTION")
+    for ddl in IDX_DDL_CREATE:
+        cur.execute(ddl)
+    conn.commit()
+    cur.close()
+
+def fk_sanity_checks(conn):
+    cur = conn.cursor()
+    checks = {}
+
+    q = """
+    SELECT COUNT(*) 
+    FROM `messages` m LEFT JOIN `conversations` c ON m.`conversationId`=c.`id`
+    WHERE c.`id` IS NULL
+    """
+    cur.execute(q); checks["orphans_messages_conversation"] = cur.fetchone()[0]
+
+    q = """
+    SELECT COUNT(*)
+    FROM `likes` l LEFT JOIN `messages` m ON l.`messageId`=m.`id`
+    WHERE m.`id` IS NULL
+    """
+    cur.execute(q); checks["orphans_likes_message"] = cur.fetchone()[0]
+
+    q = """
+    SELECT COUNT(*)
+    FROM `likes` l LEFT JOIN `users` u ON l.`userId`=u.`id`
+    WHERE u.`id` IS NULL
+    """
+    cur.execute(q); checks["orphans_likes_user"] = cur.fetchone()[0]
+
+    q = """
+    SELECT COUNT(*)
+    FROM `conversation_participants` cp
+    LEFT JOIN `conversations` c ON cp.`conversationId`=c.`id`
+    WHERE c.`id` IS NULL
+    """
+    cur.execute(q); checks["orphans_participants_conv"] = cur.fetchone()[0]
+
+    q = """
+    SELECT COUNT(*)
+    FROM `conversation_participants` cp
+    LEFT JOIN `users` u ON cp.`userId`=u.`id`
+    WHERE u.`id` IS NULL
+    """
+    cur.execute(q); checks["orphans_participants_user"] = cur.fetchone()[0]
+
+    cur.close()
+    return checks
+
+def main():
+    t0 = time.time()
+    conn = connect()
+
+    # Lookup: models
+    ensure_models(conn)
+    print("[models] valmis")
+
+    # Indeksite minimeerimine masslaadimiseks
+    drop_secondary_indexes(conn)
+
+    # Täida users
+    t_users = seed_users(conn, CFG["USERS_TARGET"])
+    users_total = CFG["USERS_TARGET"]  # kuna me sisestame ID=1..N
+    # Täida conversations (+ owner kui participant)
+    t_convs = seed_conversations(conn, CFG["CONVERSATIONS_TARGET"], users_total)
+    convs_total = CFG["CONVERSATIONS_TARGET"]
+    # Lisa osa täiendavaid osalejaid
+    t_parts = seed_extra_participants(conn, convs_total, users_total)
+
+    # Messages (arvestab rolli-triggereid ja FK-sid)
+    # Hangi model_id’d
+    cur = conn.cursor()
+    cur.execute("SELECT `id` FROM `models`")
+    model_ids = [r[0] for r in cur.fetchall()]
+    cur.close()
+
+    t_msgs = seed_messages(conn, CFG["MESSAGES_TARGET"], users_total, convs_total, model_ids)
+    # Likes
+    t_likes = seed_likes(conn, CFG["MESSAGES_TARGET"], users_total)
+    # Shares
+    t_shares = seed_shares(conn, convs_total)
+
+    # Taasta sekundaarsed indeksid
+    create_secondary_indexes(conn)
+
+    # Raport – RTRIM & count
+    cur = conn.cursor()
+    table_counts = {}
+    for tbl in ["models","users","conversations","conversation_participants","messages","likes","conversation_shares"]:
+        table_counts[tbl] = count_rows(cur, tbl)
+    cur.close()
+
+    # FK sanity
+    checks = fk_sanity_checks(conn)
+
+    total_time = time.time() - t0
+
+    # Väljastus
+    print("\n================ RAPORT ================")
+    print("Realaadimised (sek):")
+    print(f"  users: {t_users:.1f}s")
+    print(f"  conversations: {t_convs:.1f}s")
+    print(f"  participants(extra): {t_parts:.1f}s")
+    print(f"  messages: {t_msgs:.1f}s")
+    print(f"  likes: {t_likes:.1f}s")
+    print(f"  shares: {t_shares:.1f}s")
+    print("----------------------------------------")
+    print("Tabelite ridade arv:")
+    for k,v in table_counts.items():
+        print(f"  {k:28s} {v:,}")
+    print("----------------------------------------")
+    print("Tervikluse kontroll (orvuread):")
+    for k,v in checks.items():
+        print(f"  {k:28s} {v}")
+    print("----------------------------------------")
+    print("Ehtsuse kirjeldus:")
+    print("  - Nimed EN/EE komplektist; emailid local@domain.tld unikaalsed id-suffiksiga")
+    print("  - Aadressid: 'Tänav nr, postiindeks, linn' realistlik muster")
+    print("  - Kuupäevad 2019-01-01 .. täna; 'sent_at' juhuslik")
+    print("  - Tokenid/latency/cost: realistlikud vahemikud; total_tokens = prompt+completion")
+    print("  - Rolli-reeglid: user→userId!=NULL; assistant/system→model_id!=NULL")
+    print("----------------------------------------")
+    print(f"Kogukestus: {total_time/60:.2f} min")
+    print("========================================")
+
+    conn.close()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except mc.Error as e:
+        print("MySQL error:", e)
+        sys.exit(2)
